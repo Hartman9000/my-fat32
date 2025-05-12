@@ -1,0 +1,2 @@
+LAB=fat32
+LAB_NUM=3

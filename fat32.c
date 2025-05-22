@@ -8,8 +8,253 @@
 #include <sys/mman.h> 
 #include "fat32.h"
 
+#define OFT_SIZE 128
+#define MAX_PATH_LEN 128
+#define FAT_MUSK 0x0FFFFFFF
+#define MAX_FILESINFO_SIZE 1024
+
+typedef struct OFTNode{
+    int fd;
+    int first_clus;
+    int offset;
+    int file_size;
+    struct OFTNode *next;
+} OFTNode;
+
+OFTNode *oft_head = NULL;
+int opened_files = 0;
+
+// 参数: first_clus - 文件的第一个簇号
+// 返回: 成功时返回分配的文件描述符，失败时返回-1
+int oft_add(int first_clus, int file_size) {
+    // 检查是否已达到最大打开文件数
+    if (opened_files >= OFT_SIZE) {
+        return -1;  // 打开文件数量已达上限
+    }
+    
+    // 分配新节点
+    OFTNode *new_node = (OFTNode *)malloc(sizeof(OFTNode));
+    if (new_node == NULL) {
+        return -1;  // 内存分配失败
+    }
+    
+    // 分配文件描述符（简单递增方式）
+    static int next_fd = 3;  // 保留0,1,2为标准输入/输出/错误
+    int fd = next_fd++;
+    
+    // 初始化新节点
+    new_node->fd = fd;
+    new_node->first_clus = first_clus;
+    new_node->offset = 0;  // 初始偏移量为0
+    new_node->file_size = file_size;
+    new_node->next = NULL;
+    
+    // 将节点添加到链表头部
+    if (oft_head == NULL) {
+        oft_head = new_node;
+    } else {
+        new_node->next = oft_head;
+        oft_head = new_node;
+    }
+    // 更新打开文件计数
+    opened_files++;
+    return fd;
+}
+
+// 从OFT中查找指定文件描述符的节点
+// 参数: fd - 要查找的文件描述符
+// 返回: 成功时返回节点指针，失败时返回NULL
+OFTNode* oft_find(int fd) {
+    OFTNode *current = oft_head;
+    
+    while (current != NULL) {
+        if (current->fd == fd) {
+            return current;  // 找到匹配的节点
+        }
+        current = current->next;
+    }
+    
+    return NULL;  // 未找到匹配的节点
+}
+
+// 从OFT中删除指定文件描述符的节点
+// 参数: fd - 要删除的文件描述符
+// 返回: 成功时返回0，失败时返回-1
+int oft_remove(int fd) {
+    if (oft_head == NULL) {
+        return -1;  // 链表为空
+    }
+    
+    OFTNode *current = oft_head;
+    OFTNode *prev = NULL;
+    
+    // 查找要删除的节点
+    while (current != NULL && current->fd != fd) {
+        prev = current;
+        current = current->next;
+    }
+    
+    if (current == NULL) {
+        return -1;  // 未找到匹配的节点
+    }
+    
+    // 从链表中移除节点
+    if (prev == NULL) {
+        // 删除的是头节点
+        oft_head = current->next;
+    } else {
+        // 删除的是中间或尾节点
+        prev->next = current->next;
+    }
+    
+    // 释放节点内存
+    free(current);
+    
+    // 更新打开文件计数
+    opened_files--;
+    
+    return 0;  // 删除成功
+}
+
+typedef struct DirEntry Dir_entry;
+
 struct Fat32BPB *hdr; // 指向 BPB 的数据
 int mounted = -1; // 是否已挂载成功
+int fat_first_sec;
+int data_first_sec;
+int bytes_per_clus;
+
+//给定数据区簇号，计算全局簇号
+static inline int clus_d2g(int num) {
+    return data_first_sec + (num - 2) * hdr->BPB_SecPerClus;
+}
+
+//给定全局簇号以及sector数，返回相应位置指针
+static inline uint8_t *ptr_at_g(int clus_g, int sec) {
+    return (uint8_t *)hdr + (clus_g * hdr->BPB_SecPerClus + sec) * hdr->BPB_BytsPerSec;
+}
+
+//给定数据区簇号以及sector数，返回相应指针
+static inline uint8_t *ptr_at_d(int clus_d, int sec) {
+    int clus_g = clus_d2g(clus_d);
+    return ptr_at_g(clus_g, sec);
+}
+
+//标准化文件名
+static inline char *standardize_filename(char *filename) {
+    char *std_filename = (char *)malloc(11 * sizeof(char));
+    // 初始化为全空格
+    memset(std_filename, ' ', 11);
+    // 文件名部分 (前8个字符)
+    int i = 0;
+    int j = 0;
+    // 寻找'.'或结束符前的字符作为文件名
+    while(filename[i] != '\0' && filename[i] != '.' && j < 8) {
+        // 转换为大写
+        std_filename[j++] = toupper(filename[i++]);
+    }
+    // 找到扩展名的位置(如果有的话)
+    while(filename[i] != '\0' && filename[i] != '.') {
+        i++;
+    }
+    // 处理扩展名
+    if(filename[i] == '.') {
+        i++; // 跳过'.'
+        j = 8; // 扩展名从第8个位置开始
+        // 最多取3个字符作为扩展名
+        while(filename[i] != '\0' && j < 11) {
+            std_filename[j++] = toupper(filename[i++]);
+        }
+    }
+    return std_filename;
+}
+
+//给定当前簇号，返回下一簇号，异常返回-2，结尾返回-1
+static inline int next_clus_d(int current_clus_d) {
+    uint32_t *fat_ptr = (uint32_t *)ptr_at_g(0, fat_first_sec);
+    uint32_t fat_value = (*(fat_ptr + current_clus_d)) & FAT_MUSK;
+    if (fat_value == 0xFFFFFF7) return -2;  //bad cluster
+    else if (fat_value == 0xFFFFFFF) return -1; //EOF
+    else return (int)fat_value;
+}
+
+//接受当前目录文件的第一个簇号和目标文件名
+//返回目标文件的第一簇号，并修改filesize
+int locate_first_cluster(int current_dir_clus, char *filename, int *filesize) {
+    //首先将文件名标准化，转化为大小为11的char数组
+    char *std_filename = standardize_filename(filename);
+
+    Dir_entry *dir_entry = (Dir_entry *)(ptr_at_d(current_dir_clus, 0));
+    
+    int bytes_readed = 0;
+    while(bytes_readed < bytes_per_clus) {
+        uint8_t first_byte = *(uint8_t *)dir_entry;
+        if (first_byte == 0x00) break;
+        else if (first_byte == 0xE5) {
+            dir_entry ++;
+            bytes_readed += 32;
+            continue;
+        }
+
+        int flag = 1;
+        for (int i = 0; i < 11; i++) {
+            if (std_filename[i] != dir_entry->DIR_Name[i]) {
+                flag = 0;
+                break;
+            }
+        }
+        if (flag) {
+            *filesize = (int)dir_entry->DIR_FileSize;
+            return ((uint32_t)dir_entry->DIR_FstClusHI << 16) | ((uint32_t)dir_entry->DIR_FstClusLO);
+        }
+        dir_entry ++;
+        bytes_readed += 32;
+    }
+
+    if (bytes_readed == bytes_per_clus) {
+        int next_dir_clus_d = next_clus_d(current_dir_clus);
+        if (next_dir_clus_d >= 2) {
+            return locate_first_cluster(next_dir_clus_d, filename, filesize);
+        }
+    }
+    return -1; //未找到文件
+}
+
+// 拆分路径字符串为多个组件
+// path - 要拆分的路径
+// components - 用于存储路径组件的字符串数组
+// 返回：组件数量
+int split_path(const char *path, char **components) {
+    if (path == NULL || components == NULL) {
+        return 0;
+    }
+    
+    // 创建路径的副本，因为strtok会修改原字符串
+    char *path_copy = strdup(path);
+    if (path_copy == NULL) {
+        return 0;
+    }
+    
+    int count = 0;
+    char *token;
+    
+    // 处理路径起始的斜杠
+    char *start = path_copy;
+    if (*start == '/') {
+        start++;
+    }
+    
+    // 使用'/'作为分隔符拆分路径
+    token = strtok(start, "/");
+    while (token != NULL && count < MAX_PATH_LEN) { // 设置最大组件数量限制
+        components[count] = strdup(token);
+        count++;
+        token = strtok(NULL, "/");
+    }
+    
+    free(path_copy);
+    return count;
+}
 
 // 挂载磁盘镜像
 int fat_mount(const char *path) {
@@ -49,29 +294,136 @@ int fat_mount(const char *path) {
 
     // 挂载成功
     mounted = 0;
+    fat_first_sec = hdr->BPB_RsvdSecCnt;
+    data_first_sec = hdr->BPB_RsvdSecCnt + hdr->BPB_FATSz32 * hdr->BPB_NumFATs;
+    bytes_per_clus = hdr->BPB_BytsPerSec * hdr->BPB_SecPerClus;
     return 0;
 }
 
-// 打开文件
 int fat_open(const char *path) {
-    // TODO
-    return -1;
+    if (opened_files == OFT_SIZE) return -1;
+    char **path_files = (char **)malloc(MAX_PATH_LEN * sizeof(char *));
+    if (path_files == NULL) return -1;
+    int files_count = split_path(path, path_files);
+    if (files_count <= 0) {
+        free(path_files);
+        return -1;
+    }
+
+    int current_file_clus = hdr->BPB_RootClus;
+    int file_size = 0;
+    for (int i = 0; i < files_count; i++) {
+        current_file_clus = locate_first_cluster(current_file_clus, path_files[i], &file_size);
+    }
+
+    for (int i = 0; i < files_count; i++) {
+        free(path_files[i]);
+    }
+    free(path_files);
+
+    return oft_add(current_file_clus, file_size);
 }
 
 // 关闭文件
 int fat_close(int fd) {
-    // TODO
-    return -1;
+    return oft_remove(fd);
 }
 
-// 读取普通文件内容
 int fat_pread(int fd, void *buffer, int count, int offset) {
-    // TODO
-    return -1;
+    OFTNode *fileinfo = oft_find(fd);
+    if (fileinfo == NULL) return -1;
+
+    int file_size = fileinfo->file_size;
+    printf("DEBUG: file_size = %d\n", file_size);
+    
+    if (count == 0 || offset >= file_size) {
+        return 0;
+    }
+    if (offset + count > file_size) {
+        count = file_size - offset;
+    }
+    int origin_count = count;
+
+    int current_clus = fileinfo->first_clus;
+    while (offset >= bytes_per_clus) {
+        current_clus = next_clus_d(current_clus);
+        if (current_clus == -2) return -1;
+        offset -= bytes_per_clus;
+    }
+    uint8_t *src = ptr_at_d(current_clus, 0);
+    src += offset;
+    if (offset + count <= bytes_per_clus) {
+        memcpy(buffer, (void *)src, count);
+        return count;
+    }
+    else {
+        int rest_of_clus = bytes_per_clus - offset;
+        memcpy(buffer, (void *)src, rest_of_clus);
+        uint8_t *dest = (uint8_t *)buffer + rest_of_clus;
+        count -= rest_of_clus;
+        while (1) {
+            current_clus = next_clus_d(current_clus);
+            if (current_clus == -2) return -1;
+            src = ptr_at_d(current_clus, 0);
+            if (count <= bytes_per_clus) {
+                memcpy((void *)dest, (void *)src, count);
+                return origin_count;
+            }
+            memcpy((void *)dest, (void *)src, bytes_per_clus);
+            count -= bytes_per_clus;
+            dest += bytes_per_clus;
+        }
+    }
 }
 
-// 读取目录文件内容 (目录项)
 struct FilesInfo* fat_readdir(const char *path) {
-    // TODO
-    return NULL;
+    //找到目标目录的首簇
+    int target_dir_clus = hdr->BPB_RootClus;
+    if (strcmp(path, "/") != 0) {
+        char **path_dirs = (char **)malloc(MAX_PATH_LEN * sizeof(char *));
+        if (path_dirs == NULL) return NULL;
+        int dirs_count = split_path(path, path_dirs);
+        if (dirs_count <= 0) return NULL;
+
+        int temp = 0;
+        for (int i = 0; i < dirs_count; i++) {
+            target_dir_clus = locate_first_cluster(target_dir_clus, path_dirs[i], &temp);
+            if (target_dir_clus < 2) return NULL;
+        }
+    }
+
+    struct FileInfo *file_info = (struct FileInfo *)malloc(MAX_FILESINFO_SIZE * sizeof(struct FileInfo));
+    if (file_info == NULL) return NULL;
+
+    //遍历目录
+    Dir_entry *dir_entry = (Dir_entry *)(ptr_at_d(target_dir_clus, 0));
+    int size = 0;
+    while (1) {
+        int bytes_readed = 0;
+        while(bytes_readed < bytes_per_clus) {
+            uint8_t first_byte = *(uint8_t *)dir_entry;
+            if (first_byte == 0x00) {
+                struct FilesInfo *filesinfo = (struct FilesInfo *)malloc(sizeof(struct FilesInfo));
+                if (filesinfo == NULL) return NULL;
+                filesinfo->files = file_info;
+                filesinfo->size = size;
+                return filesinfo;
+            }
+            else if (first_byte == 0xE5) {
+                bytes_readed += 32;
+                dir_entry++;
+                continue;;
+            }
+
+            file_info[size].DIR_FileSize = dir_entry->DIR_FileSize;
+            memcpy((void *)file_info[size].DIR_Name, (void *)dir_entry->DIR_Name, 11);
+            size++;
+
+            bytes_readed += 32;
+            dir_entry++;
+        }
+        target_dir_clus = next_clus_d(target_dir_clus);
+        if (target_dir_clus < 2) return NULL;
+        dir_entry = (Dir_entry *)(ptr_at_d(target_dir_clus, 0));
+    }
 }

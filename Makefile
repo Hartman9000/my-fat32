@@ -11,6 +11,8 @@ main.o: main.c
 clean:
 	rm -f *.o main
 
+test:
+	gcc -o test_fat32 test_fat32.c fat32.c
 
 STYLE=\033[1;31m
 NC=\033[0m

@@ -13,6 +13,13 @@
 #define FAT_MUSK 0x0FFFFFFF
 #define MAX_FILESINFO_SIZE 1024
 
+enum EntryType {
+    TYPE_FILE = 0x01,
+    TYPE_DIR = 0x02,
+    TYPE_VOLUME = 0x04,
+    TYPE_ANY = 0xFF
+};
+
 typedef struct OFTNode{
     int fd;
     int first_clus;
@@ -124,20 +131,34 @@ int fat_first_sec;
 int data_first_sec;
 int bytes_per_clus;
 
-//给定数据区簇号，计算全局簇号
-static inline int clus_d2g(int num) {
-    return data_first_sec + (num - 2) * hdr->BPB_SecPerClus;
+// 将数据区簇号转换为对应的第一个扇区号
+static inline int clus_to_sec(int clus_d) {
+    if (clus_d < 2) {
+        printf("ERROR: Invalid cluster number: %d\n", clus_d);
+        return -1;
+    }
+    return data_first_sec + (clus_d - 2) * hdr->BPB_SecPerClus;
 }
 
-//给定全局簇号以及sector数，返回相应位置指针
-static inline uint8_t *ptr_at_g(int clus_g, int sec) {
-    return (uint8_t *)hdr + (clus_g * hdr->BPB_SecPerClus + sec) * hdr->BPB_BytsPerSec;
+// 给定扇区号和扇区内偏移，返回对应指针
+static inline uint8_t *ptr_at_sec(int sec_num, int sec_offset) {
+    return (uint8_t *)hdr + sec_num * hdr->BPB_BytsPerSec + sec_offset;
 }
 
-//给定数据区簇号以及sector数，返回相应指针
-static inline uint8_t *ptr_at_d(int clus_d, int sec) {
-    int clus_g = clus_d2g(clus_d);
-    return ptr_at_g(clus_g, sec);
+// 给定数据区簇号和簇内扇区偏移，返回对应指针
+static inline uint8_t *ptr_at_clus(int clus_d, int sec) {
+    if (clus_d < 2) {
+        printf("ERROR: Invalid cluster number: %d\n", clus_d);
+        return NULL;
+    }
+    // 确保扇区偏移在有效范围内
+    if (sec >= hdr->BPB_SecPerClus) {
+        printf("ERROR: Invalid sector offset: %d\n", sec);
+        return NULL;
+    }
+    
+    int first_sec = clus_to_sec(clus_d);
+    return ptr_at_sec(first_sec + sec, 0);
 }
 
 //标准化文件名
@@ -170,32 +191,44 @@ static inline char *standardize_filename(char *filename) {
 }
 
 //给定当前簇号，返回下一簇号，异常返回-2，结尾返回-1
-static inline int next_clus_d(int current_clus_d) {
-    uint32_t *fat_ptr = (uint32_t *)ptr_at_g(0, fat_first_sec);
-    uint32_t fat_value = (*(fat_ptr + current_clus_d)) & FAT_MUSK;
-    if (fat_value == 0xFFFFFF7) return -2;  //bad cluster
-    else if (fat_value == 0xFFFFFFF) return -1; //EOF
-    else return (int)fat_value;
+static inline int next_clus(int current_clus_d) {
+    if (current_clus_d < 2) {
+        printf("ERROR: Invalid cluster number: %d\n", current_clus_d);
+        return -2;
+    }
+    
+    // 计算FAT表的指针位置
+    uint32_t *fat_table = (uint32_t *)ptr_at_sec(fat_first_sec, 0);
+    if (fat_table == NULL) return -2;
+    
+    // 获取FAT表中对应簇的条目值
+    uint32_t fat_value = (*(fat_table + current_clus_d)) & FAT_MUSK;
+    
+    // 解析FAT条目值
+    if (fat_value >= 0x0FFFFFF8) return -1;      // EOC (End Of Chain)
+    else if (fat_value == 0x0FFFFFF7) return -2; // Bad cluster
+    else return (int)fat_value;                  // 下一个簇号
 }
 
 //接受当前目录文件的第一个簇号和目标文件名
 //返回目标文件的第一簇号，并修改filesize
-int locate_first_cluster(int current_dir_clus, char *filename, int *filesize) {
+int locate_first_cluster(int current_dir_clus, char *filename, int *filesize, int expected_type) {
     //首先将文件名标准化，转化为大小为11的char数组
     char *std_filename = standardize_filename(filename);
+    // printf("DEBUG: filename [%s] standarded to [%s]\n", filename, std_filename);
 
-    Dir_entry *dir_entry = (Dir_entry *)(ptr_at_d(current_dir_clus, 0));
+    Dir_entry *dir_entry = (Dir_entry *)(ptr_at_clus(current_dir_clus, 0));
     
     int bytes_readed = 0;
     while(bytes_readed < bytes_per_clus) {
         uint8_t first_byte = *(uint8_t *)dir_entry;
         if (first_byte == 0x00) break;
-        else if (first_byte == 0xE5) {
+        else if (first_byte == 0xE5 || (dir_entry->DIR_Attr & LONG_NAME_MASK) == LONG_NAME) {
             dir_entry ++;
             bytes_readed += 32;
             continue;
         }
-
+        // printf("DEBUG: checking dir entry [%s]\n", dir_entry->DIR_Name);
         int flag = 1;
         for (int i = 0; i < 11; i++) {
             if (std_filename[i] != dir_entry->DIR_Name[i]) {
@@ -204,19 +237,40 @@ int locate_first_cluster(int current_dir_clus, char *filename, int *filesize) {
             }
         }
         if (flag) {
+            int entry_type = 0;
+            if (dir_entry->DIR_Attr & DIRECTORY) {
+                entry_type = TYPE_DIR;
+            } else if (dir_entry->DIR_Attr & VOLUME_ID) {
+                entry_type = TYPE_VOLUME;
+            } else {
+                entry_type = TYPE_FILE;
+            }
+            if (!(entry_type & expected_type)) {
+                dir_entry++;
+                bytes_readed += 32;
+                continue;
+            }
+
             *filesize = (int)dir_entry->DIR_FileSize;
-            return ((uint32_t)dir_entry->DIR_FstClusHI << 16) | ((uint32_t)dir_entry->DIR_FstClusLO);
+            uint32_t target_clus = ((uint32_t)dir_entry->DIR_FstClusHI << 16) | ((uint32_t)dir_entry->DIR_FstClusLO);
+            // printf("DEBUG: %s founded, size: %d, clus: %u\n", std_filename, *filesize, target_clus);
+            free(std_filename);
+            return target_clus;
         }
         dir_entry ++;
         bytes_readed += 32;
     }
 
     if (bytes_readed == bytes_per_clus) {
-        int next_dir_clus_d = next_clus_d(current_dir_clus);
+        int next_dir_clus_d = next_clus(current_dir_clus);
         if (next_dir_clus_d >= 2) {
-            return locate_first_cluster(next_dir_clus_d, filename, filesize);
+            int result = locate_first_cluster(next_dir_clus_d, filename, filesize, expected_type);
+            free(std_filename);
+            return result;
         }
     }
+    // printf("DEBUG: file [%s] locate failed\n", std_filename);
+    free(std_filename);
     return -1; //未找到文件
 }
 
@@ -305,6 +359,11 @@ int fat_open(const char *path) {
     char **path_files = (char **)malloc(MAX_PATH_LEN * sizeof(char *));
     if (path_files == NULL) return -1;
     int files_count = split_path(path, path_files);
+    // printf("DEBUG: open path count:%d\n", files_count);
+    // for (int i = 0; i < files_count; i++) {
+    //     printf("DEBUG:\t\t[%d]: %s\n", i, path_files[i]);
+    // }
+
     if (files_count <= 0) {
         free(path_files);
         return -1;
@@ -312,8 +371,29 @@ int fat_open(const char *path) {
 
     int current_file_clus = hdr->BPB_RootClus;
     int file_size = 0;
-    for (int i = 0; i < files_count; i++) {
-        current_file_clus = locate_first_cluster(current_file_clus, path_files[i], &file_size);
+
+    // 对路径中的中间组件，只接受目录类型
+    for (int i = 0; i < files_count - 1; i++) {
+        current_file_clus = locate_first_cluster(current_file_clus, path_files[i], &file_size, TYPE_DIR);
+        if (current_file_clus < 2) {
+            // 清理资源
+            for (int j = 0; j < files_count; j++) {
+                free(path_files[j]);
+            }
+            free(path_files);
+            return -1;
+        }
+    }
+
+    // 对最后一个组件，只接受文件类型
+    current_file_clus = locate_first_cluster(current_file_clus, path_files[files_count-1], &file_size, TYPE_FILE);
+    if (current_file_clus < 2) {
+        // 清理资源
+        for (int j = 0; j < files_count; j++) {
+            free(path_files[j]);
+        }
+        free(path_files);
+        return -1;
     }
 
     for (int i = 0; i < files_count; i++) {
@@ -330,11 +410,15 @@ int fat_close(int fd) {
 }
 
 int fat_pread(int fd, void *buffer, int count, int offset) {
+    if (buffer == NULL || count < 0 || offset < 0) {
+        return -1;
+    }
+
     OFTNode *fileinfo = oft_find(fd);
     if (fileinfo == NULL) return -1;
 
     int file_size = fileinfo->file_size;
-    printf("DEBUG: file_size = %d\n", file_size);
+    // printf("DEBUG: reading file size = %d\n", file_size);
     
     if (count == 0 || offset >= file_size) {
         return 0;
@@ -346,11 +430,11 @@ int fat_pread(int fd, void *buffer, int count, int offset) {
 
     int current_clus = fileinfo->first_clus;
     while (offset >= bytes_per_clus) {
-        current_clus = next_clus_d(current_clus);
+        current_clus = next_clus(current_clus);
         if (current_clus == -2) return -1;
         offset -= bytes_per_clus;
     }
-    uint8_t *src = ptr_at_d(current_clus, 0);
+    uint8_t *src = ptr_at_clus(current_clus, 0);
     src += offset;
     if (offset + count <= bytes_per_clus) {
         memcpy(buffer, (void *)src, count);
@@ -362,9 +446,9 @@ int fat_pread(int fd, void *buffer, int count, int offset) {
         uint8_t *dest = (uint8_t *)buffer + rest_of_clus;
         count -= rest_of_clus;
         while (1) {
-            current_clus = next_clus_d(current_clus);
+            current_clus = next_clus(current_clus);
             if (current_clus == -2) return -1;
-            src = ptr_at_d(current_clus, 0);
+            src = ptr_at_clus(current_clus, 0);
             if (count <= bytes_per_clus) {
                 memcpy((void *)dest, (void *)src, count);
                 return origin_count;
@@ -387,16 +471,22 @@ struct FilesInfo* fat_readdir(const char *path) {
 
         int temp = 0;
         for (int i = 0; i < dirs_count; i++) {
-            target_dir_clus = locate_first_cluster(target_dir_clus, path_dirs[i], &temp);
+            target_dir_clus = locate_first_cluster(target_dir_clus, path_dirs[i], &temp, TYPE_DIR);
             if (target_dir_clus < 2) return NULL;
         }
+
+        // 清理资源
+        for (int i = 0; i < dirs_count; i++) {
+            free(path_dirs[i]);
+        }
+        free(path_dirs);
     }
 
     struct FileInfo *file_info = (struct FileInfo *)malloc(MAX_FILESINFO_SIZE * sizeof(struct FileInfo));
     if (file_info == NULL) return NULL;
 
     //遍历目录
-    Dir_entry *dir_entry = (Dir_entry *)(ptr_at_d(target_dir_clus, 0));
+    Dir_entry *dir_entry = (Dir_entry *)(ptr_at_clus(target_dir_clus, 0));
     int size = 0;
     while (1) {
         int bytes_readed = 0;
@@ -409,7 +499,7 @@ struct FilesInfo* fat_readdir(const char *path) {
                 filesinfo->size = size;
                 return filesinfo;
             }
-            else if (first_byte == 0xE5) {
+            else if (first_byte == 0xE5 || (dir_entry->DIR_Attr & LONG_NAME_MASK) == LONG_NAME) {
                 bytes_readed += 32;
                 dir_entry++;
                 continue;;
@@ -422,8 +512,8 @@ struct FilesInfo* fat_readdir(const char *path) {
             bytes_readed += 32;
             dir_entry++;
         }
-        target_dir_clus = next_clus_d(target_dir_clus);
+        target_dir_clus = next_clus(target_dir_clus);
         if (target_dir_clus < 2) return NULL;
-        dir_entry = (Dir_entry *)(ptr_at_d(target_dir_clus, 0));
+        dir_entry = (Dir_entry *)(ptr_at_clus(target_dir_clus, 0));
     }
 }

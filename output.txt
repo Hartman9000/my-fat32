@@ -1,0 +1,112 @@
+ !w /mnt
+> cat exam_10.txt | head -n 5
+The DIR_Name field contains the 11 character (“short”) name of the file or sub-directory
+described by the corresponding entry containing the field. The DIR_Name field is logically
+comprised of two components:
+ The 8-character main part of the name
+ The 3-character extension
+
+ !w /mnt
+> ls
+DIR_1  exam_10.txt  exam_3.txt  exam_6.txt  exam_9.txt
+DIR_2  exam_1.txt   exam_4.txt  exam_7.txt
+DIR_3  exam_2.txt   exam_5.txt  exam_8.txt
+
+ !w /mnt
+> cat exam_2.txt | head -n 5
+Determination of FAT type (FAT12, FAT16, or FAT32) is dependent on the number of clusters
+(described in Section 3.5 below).
+This section describes the determination of values for specific fields in the BPB during volume
+initialization for a given target volume. FAT implementations must be capable of mounting media
+with all legal values for fields comprising the BPB.
+
+ !w /mnt
+> cd DIR_1
+
+ !w /mnt/DIR_1
+> ls
+111.txt  555.txt
+
+ !w /mnt/DIR_1
+> cat 555.txt | head -n 2
+1948年，图灵接受了曼彻斯特大学的高级讲师职务，并被指定为曼彻斯特自动数字计算机项目的负责人助理，具体领导该项目数学方面的工作。作为这一工作的总结，1950年图灵编写并出版了《曼彻斯特电子计算机程序员手册》这期间，他继续进行数理逻辑方面的理论研究。
+
+
+ !w /mnt/DIR_1
+> cd ../DIR_2
+
+ !w /mnt/DIR_2
+> ls
+PEOPLE
+
+ !w /mnt/DIR_2
+> cd PEOPLE
+
+ !w /mnt/DIR_2/PEOPLE
+> ls
+ABK2Y  DGM4D   DSN9M         JIC7P   KML2D  PMC8P  RJS5U
+AG8T   DHO2B   DWA2X         JJP9K   KRM9Z  POH6E  SL6FT
+AJW3M  DKB4J   EXAMPLE2.TXT  JMH5ET  LL2EF  PP2DF  SMB3WK
+BHS2E  DMH2W   FLS4T         JPB4J   MPW8Y  PRF4V  SMW2J
+BJA6A  DMK3D   GRD7Y         KBC5V   MSD7R  PVL4J  SV9WN
+BMS7V  DMS2PH  JDW7E         KDM5Z   ODG4N  RAT2Z  WAB2M
+CRJ8J  DNM5Z   JGJ3H         KJL2Y   PDS7C  RCE2A  YYZ5W
+
+ !w /mnt/DIR_2/PEOPLE
+> cat EXAMPLE2.TXT | head -n 2
+The contents of example2.
+
+ !w /mnt/DIR_2/PEOPLE
+> cd DHO2B
+
+ !w /mnt/DIR_2/PEOPLE/DHO2B
+> ls
+THE-GAME.TXT
+
+ !w /mnt/DIR_2/PEOPLE/DHO2B
+> cat THE-GAME.TXT | head -n 2
+Subject: for your amusement
+To: csfaculty@uvacs.cs.virginia.edu
+
+ !w /mnt/DIR_2/PEOPLE/DHO2B
+> cd /mnt/
+
+ !w /mnt
+> ls
+DIR_1  exam_10.txt  exam_3.txt  exam_6.txt  exam_9.txt
+DIR_2  exam_1.txt   exam_4.txt  exam_7.txt
+DIR_3  exam_2.txt   exam_5.txt  exam_8.txt
+
+ !w /mnt
+> cd DIR_3
+
+ !w /mnt/DIR_3
+> ls
+
+ !w /mnt/DIR_3
+> cd ../DIR_2
+
+ !w /mnt/DIR_2
+> ls
+PEOPLE
+
+ !w /mnt/DIR_2
+> cd ../DIR_1
+
+ !w /mnt/DIR_1
+> ls
+111.txt  555.txt
+
+ !w /mnt/DIR_1
+> cd ..
+
+ !w /mnt
+> ls
+DIR_1  exam_10.txt  exam_3.txt  exam_6.txt  exam_9.txt
+DIR_2  exam_1.txt   exam_4.txt  exam_7.txt
+DIR_3  exam_2.txt   exam_5.txt  exam_8.txt
+
+ !w /mnt
+> cat exam_4.txt | head -n 2
+The FAT type is determined solely by the count of clusters on the volume (CountOfClusters).
+The following steps describe the computation of the count of clusters:
